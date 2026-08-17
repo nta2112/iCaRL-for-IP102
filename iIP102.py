@@ -76,14 +76,19 @@ class iIP102(Dataset):
             img = img.resize((target_size, target_size), Image.BILINEAR)
         return np.array(img)
 
-    def get_image_class(self, label):
-        if label in self._cache:
-            return self._cache[label]
-        files = self._train_by_cls[label]
+    def get_class_images(self, split, label):
+        key = (split, label)
+        if key in self._cache:
+            return self._cache[key]
+        by_cls = getattr(self, '_%s_by_cls' % split)
+        files = by_cls[label]
         arrays = np.stack([self._read_image(f, self.cache_size) for f in files])
         if self.cache_images:
-            self._cache[label] = arrays
+            self._cache[key] = arrays
         return arrays
+
+    def get_image_class(self, label):
+        return self.get_class_images('train', label)
 
     def getTrainData(self, classes, exemplar_set):
         datas, labels = [], []

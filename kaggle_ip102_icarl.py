@@ -155,14 +155,19 @@ class iIP102(Dataset):
             img = img.resize((target_size, target_size), Image.BILINEAR)
         return np.array(img)
 
-    def get_image_class(self, label):
-        if label in self._cache:
-            return self._cache[label]
-        files = self._train_by_cls[label]
+    def get_class_images(self, split, label):
+        key = (split, label)
+        if key in self._cache:
+            return self._cache[key]
+        by_cls = getattr(self, '_%s_by_cls' % split)
+        files = by_cls[label]
         arrays = np.stack([self._read_image(f, self.cache_size) for f in files])
         if self.cache_images:
-            self._cache[label] = arrays
+            self._cache[key] = arrays
         return arrays
+
+    def get_image_class(self, label):
+        return self.get_class_images('train', label)
 
     def getTrainData(self, classes, exemplar_set):
         datas, labels = [], []
@@ -386,6 +391,109 @@ def resnet18_cbam(pretrained=False):
     return model
 
 
+# ============================ EVALUATION METRICS =============================
+def calculate_auroc_numpy(y_true, y_scores):
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_scores = np.asarray(y_scores, dtype=np.float64)
+    desc = np.argsort(y_scores)[::-1]
+    y_true = y_true[desc]
+    y_scores = y_scores[desc]
+    n_pos = np.sum(y_true)
+    n_neg = len(y_true) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5, np.array([0.0, 1.0]), np.array([0.0, 1.0])
+    tp = np.cumsum(y_true)
+    fp = np.cumsum(1 - y_true)
+    tpr = tp / n_pos
+    fpr = fp / n_neg
+    tpr = np.concatenate(([0.0], tpr))
+    fpr = np.concatenate(([0.0], fpr))
+    area = 0.0
+    for i in range(len(fpr) - 1):
+        area += 0.5 * (tpr[i] + tpr[i + 1]) * (fpr[i + 1] - fpr[i])
+    return area, fpr, tpr
+
+
+def calculate_fpr_at_tpr95(fpr, tpr):
+    idx = np.where(tpr >= 0.95)[0]
+    return fpr[idx[0]] if len(idx) > 0 else 1.0
+
+
+def compute_ap(q_class, ranked_classes):
+    ap = 0.0
+    hits = 0
+    total_pos = sum(1 for g_class in ranked_classes if g_class == q_class)
+    if total_pos == 0:
+        return 0.0
+    for rank, g_class in enumerate(ranked_classes):
+        if g_class == q_class:
+            hits += 1
+            ap += hits / (rank + 1)
+            if hits == total_pos:
+                break
+    return ap / total_pos
+
+
+def l2_normalize(x):
+    x = np.asarray(x, dtype=np.float32)
+    return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-8)
+
+
+def evaluate_retrieval(q_embeds, q_classes, g_embeds, g_classes):
+    """Returns (class_metrics, macro_r1, macro_r5, macro_r10, macro_ap, q_aps, q_r1s)."""
+    q_embeds = l2_normalize(q_embeds)
+    g_embeds = l2_normalize(g_embeds)
+    q_classes = np.asarray(q_classes)
+    g_classes = np.asarray(g_classes)
+    sims = q_embeds @ g_embeds.T
+    n = len(q_embeds)
+    r1s = np.zeros(n)
+    r5s = np.zeros(n)
+    r10s = np.zeros(n)
+    aps = np.zeros(n)
+    for i in range(n):
+        ranked = g_classes[np.argsort(sims[i])[::-1]]
+        qc = q_classes[i]
+        r1s[i] = 1.0 if qc in ranked[:1] else 0.0
+        r5s[i] = 1.0 if qc in ranked[:5] else 0.0
+        r10s[i] = 1.0 if qc in ranked[:10] else 0.0
+        aps[i] = compute_ap(qc, ranked)
+    class_metrics = {}
+    for c in np.unique(q_classes):
+        mask = q_classes == c
+        class_metrics[int(c)] = {
+            'count': int(mask.sum()),
+            'R@1': float(np.mean(r1s[mask])),
+            'R@5': float(np.mean(r5s[mask])),
+            'R@10': float(np.mean(r10s[mask])),
+            'AP': float(np.mean(aps[mask])),
+        }
+    if not class_metrics:
+        return {}, 0.0, 0.0, 0.0, 0.0, aps, r1s
+    macro_r1 = np.mean([class_metrics[c]['R@1'] for c in class_metrics])
+    macro_r5 = np.mean([class_metrics[c]['R@5'] for c in class_metrics])
+    macro_r10 = np.mean([class_metrics[c]['R@10'] for c in class_metrics])
+    macro_ap = np.mean([class_metrics[c]['AP'] for c in class_metrics])
+    return (class_metrics, float(macro_r1), float(macro_r5), float(macro_r10),
+            float(macro_ap), aps, r1s)
+
+
+def evaluate_ood(q_embeds, q_classes, seen_class_means, seen_classes):
+    """Unseen classes are 'unknown'; unknown score = -max cos sim to seen class means."""
+    q_embeds = l2_normalize(q_embeds)
+    seen_class_means = l2_normalize(np.asarray(seen_class_means))
+    sims = q_embeds @ seen_class_means.T
+    unknown_score = -sims.max(axis=1)
+    seen_set = set(int(c) for c in seen_classes)
+    y_true = np.array([0 if int(c) in seen_set else 1 for c in q_classes])
+    num_pos = int(y_true.sum())
+    num_neg = len(y_true) - num_pos
+    if num_pos > 0 and num_neg > 0:
+        auroc, fpr, tpr = calculate_auroc_numpy(y_true, unknown_score)
+        return float(auroc), float(calculate_fpr_at_tpr95(fpr, tpr))
+    return None, None
+
+
 # ============================ iCaRL MODEL ====================================
 def get_one_hot(target, num_class):
     one_hot = torch.zeros(target.shape[0], num_class).to(target.device)
@@ -445,6 +553,23 @@ class iCaRLmodel:
         self.test_loader = None
         self.old_model = None
         self.save_dir = SAVE_DIR
+        self.history = {}
+        self.history_path = os.path.join(self.save_dir, 'history.json')
+        self._load_history()
+        self.task_of_class = {}
+        offset = 0
+        for tid, sz in enumerate(TASK_SIZES):
+            for c in range(offset, offset + sz):
+                self.task_of_class[c] = tid
+            offset += sz
+
+    def _load_history(self):
+        try:
+            if os.path.exists(self.history_path):
+                with open(self.history_path, 'r', encoding='utf-8') as f:
+                    self.history = json.load(f)
+        except Exception as e:
+            print('could not load history: %s' % e)
 
     def beforeTrain(self):
         self.model.eval()
@@ -538,17 +663,102 @@ class iCaRLmodel:
                     'numclass': self.numclass,
                     'class_ids': CLASS_IDS}, filename)
         print('model saved to %s' % filename)
-        self._log_result(task_id, accuracy, KNN_accuracy)
+        self.evaluate_all(task_id, accuracy, KNN_accuracy)
 
-    def _log_result(self, task_id, accuracy, knn):
+    def _embed(self, image_arrays):
+        outs = []
+        for i in range(0, len(image_arrays), 64):
+            batch = self.Image_transform(image_arrays[i:i + 64], self.test_transform).to(self.device)
+            with torch.no_grad():
+                feats = F.normalize(self.model.feature_extractor(batch).detach())
+            outs.append(feats.cpu().numpy())
+        if not outs:
+            return np.zeros((0, 512), dtype=np.float32)
+        return np.concatenate(outs, axis=0)
+
+    def _split_images(self, split, classes):
+        arrays, labels = [], []
+        for c in classes:
+            arr = self.train_dataset.get_class_images(split, c)
+            arrays.append(arr)
+            labels.append(np.full(len(arr), c))
+        return np.concatenate(arrays, axis=0), np.concatenate(labels).astype(int)
+
+    def evaluate_all(self, task_id, accuracy, knn):
+        seen = list(range(self.numclass))
+        total_classes = list(range(len(CLASS_IDS)))
+
+        val_all, val_labels = self._split_images('val', total_classes)
+        val_emb = self._embed(val_all)
+
+        test_all, test_labels = self._split_images('test', seen)
+        test_emb = self._embed(test_all)
+
+        seen_mask = np.array([c in seen for c in val_labels])
+        q_emb, q_cls = val_emb[seen_mask], val_labels[seen_mask]
+        _, macro_r1, macro_r5, macro_r10, macro_ap, q_aps, q_r1s = \
+            evaluate_retrieval(q_emb, q_cls, test_emb, test_labels)
+
+        task_ids = sorted(set(self.task_of_class[c] for c in seen))
+        group_mAP = {}
+        for t in task_ids:
+            m = np.array([self.task_of_class[c] == t for c in q_cls])
+            if m.sum() > 0:
+                group_mAP[t] = float(np.mean(q_aps[m]))
+
+        means = np.array(self.class_mean_set)
+        auroc, fpr95 = evaluate_ood(val_emb, val_labels, means, seen)
+
+        self.history[str(task_id)] = {str(t): round(group_mAP[t], 6) for t in group_mAP}
+        self._save_history()
+
+        plasticity = group_mAP.get(task_id, 0.0)
+        forgets = []
+        for t in range(task_id):
+            if str(t) in self.history and str(task_id) in self.history:
+                peak = self.history[str(t)].get(str(t), 0.0)
+                curr = self.history[str(task_id)].get(str(t), 0.0)
+                forgets.append(max(0.0, peak - curr))
+        forgetting = float(np.mean(forgets)) if forgets else 0.0
+        overall = plasticity - forgetting
+
+        print('=== Task %d evaluation ===' % task_id)
+        print('Retrieval (seen classes): R@1 %.3f | R@5 %.3f | R@10 %.3f | mAP %.3f'
+              % (macro_r1, macro_r5, macro_r10, macro_ap))
+        print('OOD AUROC %.3f | FPR@TPR95 %.3f' % ((auroc or 0.0), (fpr95 or 0.0)))
+        print('Plasticity %.3f | Forgetting %.3f | Overall %.3f'
+              % (plasticity, forgetting, overall))
+
+        self._log_result(task_id, accuracy, knn, macro_r1, macro_r5, macro_r10,
+                         macro_ap, auroc, fpr95, plasticity, forgetting, overall)
+
+    def _save_history(self):
+        try:
+            os.makedirs(self.save_dir, exist_ok=True)
+            with open(self.history_path, 'w', encoding='utf-8') as f:
+                json.dump(self.history, f, indent=2)
+        except Exception as e:
+            print('could not save history: %s' % e)
+
+    def _log_result(self, task_id, accuracy, knn, r1=0.0, r5=0.0, r10=0.0,
+                    mAP=0.0, auroc=None, fpr95=None, plasticity=0.0,
+                    forgetting=0.0, overall=0.0):
         path = os.path.join(self.save_dir, 'results.csv')
         header = not os.path.exists(path)
         with open(path, 'a', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
             if header:
-                w.writerow(['task', 'numclass', 'softmax_acc', 'knn_acc'])
+                w.writerow(['task', 'numclass', 'softmax_acc', 'knn_acc',
+                            'R@1', 'R@5', 'R@10', 'mAP',
+                            'AUROC', 'FPR95', 'Plasticity', 'Forgetting', 'Overall'])
             w.writerow([task_id, self.numclass,
-                        round(float(accuracy), 3), round(float(knn), 3)])
+                        round(float(accuracy), 3), round(float(knn), 3),
+                        round(float(r1), 3), round(float(r5), 3), round(float(r10), 3),
+                        round(float(mAP), 3),
+                        '-' if auroc is None else round(float(auroc), 3),
+                        '-' if fpr95 is None else round(float(fpr95), 3),
+                        round(float(plasticity), 3), round(float(forgetting), 3),
+                        round(float(overall), 3)])
 
     def _construct_exemplar_set(self, images, m):
         class_mean, feature_extractor_output = self.compute_class_mean(images, self.transform)
