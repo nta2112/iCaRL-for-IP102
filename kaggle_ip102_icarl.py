@@ -45,6 +45,7 @@ LEARNING_RATE = _env_float('IP102_LR', 2.0)
 LR_FRACTIONS = [0.48, 0.62, 0.80]
 LR_MULTIPLIERS = [0.2, 0.04, 0.008]
 TASK_SIZES = [7, 6, 6, 6]
+MAX_TASKS = _env_int('IP102_MAX_TASKS', len(TASK_SIZES))  # chi chay N task dau (test nhanh)
 PRETRAINED = True
 SEED = _env_int('IP102_SEED', 0)
 
@@ -837,7 +838,8 @@ def main():
     print('DATA_ROOT:', DATA_ROOT)
     print('IMAGE_DIR:', IMAGE_DIR)
     print('num_classes:', len(CLASS_IDS), CLASS_IDS)
-    print('task_sizes:', TASK_SIZES, '=> tasks:', len(TASK_SIZES))
+    print('task_sizes:', TASK_SIZES, '=> tasks:', len(TASK_SIZES),
+          '(chay %d task dau)' % min(MAX_TASKS, len(TASK_SIZES)))
     print('device:', device)
     print('batch_size=%d epochs=%d lr=%.2f memory=%d img=%d' %
           (BATCH_SIZE, EPOCHS, LEARNING_RATE, MEMORY_SIZE, IMG_SIZE))
@@ -852,7 +854,9 @@ def main():
                        learning_rate=LEARNING_RATE,
                        device=device)
 
-    for t, tsize in enumerate(TASK_SIZES):
+    num_tasks = min(MAX_TASKS, len(TASK_SIZES))
+    for t in range(num_tasks):
+        tsize = TASK_SIZES[t]
         model.numclass = sum(TASK_SIZES[:t + 1])
         model.task_size = tsize
         print('==== start task %d (classes %d..%d) ====' %
@@ -861,6 +865,7 @@ def main():
         accuracy = model.train()
         model.afterTrain(accuracy, t)
         print('==== task %d done, softmax acc %.3f ====' % (t, accuracy))
+    print('==== done: %d/%d tasks ====' % (num_tasks, len(TASK_SIZES)))
 
 
 if __name__ == '__main__':
