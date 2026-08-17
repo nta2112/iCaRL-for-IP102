@@ -159,7 +159,7 @@ class ResNet(nn.Module):
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-        self.feature = nn.AvgPool2d(4, stride=1)
+        self.feature = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, num_classes)
 
         for m in self.modules():
@@ -205,6 +205,14 @@ class ResNet(nn.Module):
         return x
 
 
+def _load_pretrained(model, url):
+    pretrained_state_dict = model_zoo.load_url(url)
+    filtered = {k: v for k, v in pretrained_state_dict.items()
+                if k not in ('fc.weight', 'fc.bias')}
+    model.load_state_dict(filtered, strict=False)
+    return model
+
+
 def resnet18_cbam(pretrained=False, **kwargs):
     """Constructs a ResNet-18 model.
     Args:
@@ -212,10 +220,7 @@ def resnet18_cbam(pretrained=False, **kwargs):
     """
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
     if pretrained:
-        pretrained_state_dict = model_zoo.load_url(model_urls['resnet18'])
-        now_state_dict        = model.state_dict()
-        now_state_dict.update(pretrained_state_dict)
-        model.load_state_dict(now_state_dict)
+        model = _load_pretrained(model, model_urls['resnet18'])
     return model
 
 
