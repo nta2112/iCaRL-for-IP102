@@ -22,45 +22,59 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.model_zoo as model_zoo
 from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 # ============================ CONFIG =========================================
-IMG_SIZE = 224          # kich thuoc anh dau vao
-CACHE_SIZE = 256        # kich thuoc cache anh (truoc khi crop)
-BATCH_SIZE = 32
-MEMORY_SIZE = 2000      # tong so exemplar
-EPOCHS = 1
-LEARNING_RATE = 2.0
+def _env_int(name, default):
+    return int(os.environ.get(name, default))
+
+
+def _env_float(name, default):
+    return float(os.environ.get(name, default))
+
+
+IMG_SIZE = _env_int('IP102_IMG_SIZE', 224)      # kich thuoc anh dau vao
+CACHE_SIZE = _env_int('IP102_CACHE_SIZE', 256)  # kich thuoc cache anh (truoc khi crop)
+BATCH_SIZE = _env_int('IP102_BATCH_SIZE', 32)
+MEMORY_SIZE = _env_int('IP102_MEMORY_SIZE', 2000)   # tong so exemplar
+EPOCHS = _env_int('IP102_EPOCHS', 1)
+LEARNING_RATE = _env_float('IP102_LR', 2.0)
 LR_FRACTIONS = [0.48, 0.62, 0.80]
 LR_MULTIPLIERS = [0.2, 0.04, 0.008]
 TASK_SIZES = [7, 6, 6, 6]
 PRETRAINED = True
-SEED = 0
+SEED = _env_int('IP102_SEED', 0)
 
 
 def find_data_root():
     if os.environ.get('IP102_DATA_ROOT'):
-        return os.environ['IP102_DATA_ROOT']
+        root = os.environ['IP102_DATA_ROOT']
+        if os.path.exists(root):
+            return root
     if os.path.isdir('/kaggle/input'):
-        for name in sorted(os.listdir('/kaggle/input')):
-            base = os.path.join('/kaggle/input', name)
-            if not os.path.isdir(base):
-                continue
-            if os.path.exists(os.path.join(base, 'train.json')):
-                return base
-            for sub in os.listdir(base):
-                cand = os.path.join(base, sub)
-                if os.path.isdir(cand) and os.path.exists(os.path.join(cand, 'train.json')):
-                    return cand
+        found = _find_dir_with_file('/kaggle/input', 'train.json', maxdepth=6)
+        if found:
+            return found
     here = os.path.dirname(os.path.abspath(__file__))
     for cand in [os.path.join(here, 'IP102 dataset'), here]:
         if os.path.exists(os.path.join(cand, 'train.json')):
             return cand
     raise FileNotFoundError('Khong tim thay thu muc dataset (train.json)')
+
+
+def _find_dir_with_file(base, filename, maxdepth=6):
+    base = os.path.abspath(base)
+    for dirpath, dirnames, filenames in os.walk(base):
+        depth = dirpath[len(base):].count(os.sep)
+        if depth > maxdepth:
+            dirnames[:] = []
+            continue
+        if filename in filenames:
+            return dirpath
+    return None
 
 
 def find_image_dir(data_root):
@@ -378,7 +392,11 @@ def _load_pretrained(model):
         except Exception:
             sd = tvm.resnet18(pretrained=True).state_dict()
     except Exception:
-        sd = model_zoo.load_url('https://download.pytorch.org/models/resnet18-5c106cde.pth')
+        try:
+            import torch.utils.model_zoo as model_zoo
+            sd = model_zoo.load_url('https://download.pytorch.org/models/resnet18-5c106cde.pth')
+        except Exception as e:
+            raise RuntimeError('Could not load ImageNet pretrained weights: %s' % e)
     filtered = {k: v for k, v in sd.items() if k not in ('fc.weight', 'fc.bias')}
     model.load_state_dict(filtered, strict=False)
     return model

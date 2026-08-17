@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-import torch.utils.model_zoo as model_zoo
 
 
 __all__ = ['ResNet', 'resnet18_cbam', 'resnet34_cbam', 'resnet50_cbam', 'resnet101_cbam',
@@ -205,9 +204,25 @@ class ResNet(nn.Module):
         return x
 
 
-def _load_pretrained(model, url):
-    pretrained_state_dict = model_zoo.load_url(url)
-    filtered = {k: v for k, v in pretrained_state_dict.items()
+def _torchvision_state_dict(name):
+    try:
+        import torchvision.models as tvm
+        model_fn = getattr(tvm, name)
+        try:
+            weights_attr = getattr(tvm, name.capitalize() + '_Weights')
+            return model_fn(weights=weights_attr.IMAGENET1K_V1).state_dict()
+        except Exception:
+            return model_fn(pretrained=True).state_dict()
+    except Exception:
+        try:
+            import torch.utils.model_zoo as model_zoo
+            return model_zoo.load_url(model_urls[name])
+        except Exception as e:
+            raise RuntimeError('Could not load ImageNet pretrained weights: %s' % e)
+
+
+def _load_pretrained(model, name):
+    filtered = {k: v for k, v in _torchvision_state_dict(name).items()
                 if k not in ('fc.weight', 'fc.bias')}
     model.load_state_dict(filtered, strict=False)
     return model
@@ -220,7 +235,7 @@ def resnet18_cbam(pretrained=False, **kwargs):
     """
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
     if pretrained:
-        model = _load_pretrained(model, model_urls['resnet18'])
+        model = _load_pretrained(model, 'resnet18')
     return model
 
 
@@ -231,10 +246,7 @@ def resnet34_cbam(pretrained=False, **kwargs):
     """
     model = ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        pretrained_state_dict = model_zoo.load_url(model_urls['resnet34'])
-        now_state_dict        = model.state_dict()
-        now_state_dict.update(pretrained_state_dict)
-        model.load_state_dict(now_state_dict)
+        model = _load_pretrained(model, 'resnet34')
     return model
 
 
@@ -245,10 +257,7 @@ def resnet50_cbam(pretrained=False, **kwargs):
     """
     model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        pretrained_state_dict = model_zoo.load_url(model_urls['resnet50'])
-        now_state_dict        = model.state_dict()
-        now_state_dict.update(pretrained_state_dict)
-        model.load_state_dict(now_state_dict)
+        model = _load_pretrained(model, 'resnet50')
     return model
 
 
@@ -259,10 +268,7 @@ def resnet101_cbam(pretrained=False, **kwargs):
     """
     model = ResNet(Bottleneck, [3, 4, 23, 3], **kwargs)
     if pretrained:
-        pretrained_state_dict = model_zoo.load_url(model_urls['resnet101'])
-        now_state_dict        = model.state_dict()
-        now_state_dict.update(pretrained_state_dict)
-        model.load_state_dict(now_state_dict)
+        model = _load_pretrained(model, 'resnet101')
     return model
 
 
@@ -273,8 +279,5 @@ def resnet152_cbam(pretrained=False, **kwargs):
     """
     model = ResNet(Bottleneck, [3, 8, 36, 3], **kwargs)
     if pretrained:
-        pretrained_state_dict = model_zoo.load_url(model_urls['resnet152'])
-        now_state_dict        = model.state_dict()
-        now_state_dict.update(pretrained_state_dict)
-        model.load_state_dict(now_state_dict)
+        model = _load_pretrained(model, 'resnet152')
     return model
