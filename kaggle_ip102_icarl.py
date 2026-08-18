@@ -14,6 +14,7 @@
 
 import copy
 import csv
+import gc
 import json
 import math
 import os
@@ -839,9 +840,15 @@ class iCaRLmodel:
         return torch.stack(tensors)
 
     def compute_class_mean(self, images, transform):
-        x = self.Image_transform(images, transform).to(self.device)
-        feature_extractor_output = F.normalize(
-            self.base_model.feature_extractor(x).detach()).cpu().numpy()
+        chunk = 64
+        outs = []
+        for i in range(0, len(images), chunk):
+            x = self.Image_transform(images[i:i + chunk], transform).to(self.device)
+            with torch.no_grad():
+                out = F.normalize(
+                    self.base_model.feature_extractor(x).detach()).cpu().numpy()
+            outs.append(out)
+        feature_extractor_output = np.concatenate(outs, axis=0)
         class_mean = np.mean(feature_extractor_output, axis=0)
         return class_mean, feature_extractor_output
 
@@ -903,6 +910,9 @@ def main():
         model.beforeTrain()
         accuracy = model.train()
         model.afterTrain(accuracy, t)
+        model.train_dataset._cache.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
         print('==== task %d done, softmax acc %.3f, time %.1f s ====' %
               (t, accuracy, time.time() - t0))
     print('==== done: %d/%d tasks, total time %.1f s ====' %
