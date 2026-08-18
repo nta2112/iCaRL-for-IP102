@@ -38,7 +38,9 @@ class iCaRLmodel:
         self.epochs = epochs
         self.learning_rate = learning_rate
         self.device = device
-        self.model = network(numclass, feature_extractor)
+        base_model = network(numclass, feature_extractor)
+        self.use_multi_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 1
+        self.model = nn.DataParallel(base_model) if self.use_multi_gpu else base_model
         self.exemplar_set = []
         self.class_mean_set = []
         self.numclass = numclass
@@ -115,12 +117,17 @@ class iCaRLmodel:
     def _get_train_and_test_dataloader(self, classes):
         self.train_dataset.getTrainData(classes, self.exemplar_set)
         self.test_dataset.getTestData(classes)
+        n_devices = torch.cuda.device_count() if self.use_multi_gpu else 1
+        bs = self.batchsize
+        while bs > n_devices and (len(self.test_dataset) % bs) in range(1, n_devices):
+            bs -= 1
         train_loader = DataLoader(dataset=self.train_dataset,
                                   shuffle=True,
-                                  batch_size=self.batchsize)
+                                  batch_size=self.batchsize,
+                                  drop_last=self.use_multi_gpu)
         test_loader = DataLoader(dataset=self.test_dataset,
                                  shuffle=False,
-                                 batch_size=self.batchsize)
+                                 batch_size=bs)
         return train_loader, test_loader
 
     def train(self):
@@ -191,16 +198,22 @@ class iCaRLmodel:
         filename = os.path.join(
             self.save_dir,
             'icarl_ip102_task%d_acc%.3f_knn%.3f.pkl' % (task_id, accuracy, KNN_accuracy))
-        torch.save({'state_dict': self.model.state_dict(),
+        sd = self.model.module.state_dict() if self.use_multi_gpu else self.model.state_dict()
+        torch.save({'state_dict': sd,
                     'numclass': self.numclass,
                     'class_ids': self.config.class_ids}, filename)
         print('model saved to %s' % filename)
         self.evaluate_all(task_id, accuracy, KNN_accuracy)
 
     def _embed(self, image_arrays):
+        chunk = 64
+        if self.use_multi_gpu:
+            n_devices = torch.cuda.device_count()
+            while chunk > n_devices and (len(image_arrays) % chunk) in range(1, n_devices):
+                chunk -= 1
         outs = []
-        for i in range(0, len(image_arrays), 64):
-            batch = self.Image_transform(image_arrays[i:i + 64], self.test_transform).to(self.device)
+        for i in range(0, len(image_arrays), chunk):
+            batch = self.Image_transform(image_arrays[i:i + chunk], self.test_transform).to(self.device)
             with torch.no_grad():
                 feats = F.normalize(self.model.feature_extractor(batch).detach())
             outs.append(feats.cpu().numpy())

@@ -221,9 +221,27 @@ def _torchvision_state_dict(name):
             raise RuntimeError('Could not load ImageNet pretrained weights: %s' % e)
 
 
+def _adapt_pretrained_state_dict(model, sd):
+    model_sd = model.state_dict()
+    filtered = {}
+    for k, v in sd.items():
+        if k not in model_sd:
+            continue
+        if tuple(v.shape) == tuple(model_sd[k].shape):
+            filtered[k] = v
+        elif k == 'conv1.weight' and v.ndim == 4 \
+                and tuple(v.shape[1:]) == (3, 7, 7) \
+                and tuple(model_sd[k].shape[1:]) == (3, 3, 3):
+            print('adapting conv1.weight 7x7 -> 3x3 (center crop)')
+            filtered[k] = v[:, :, 2:5, 2:5].contiguous()
+        else:
+            print('skip pretrained key %s (shape %s != model %s)'
+                  % (k, tuple(v.shape), tuple(model_sd[k].shape)))
+    return filtered
+
+
 def _load_pretrained(model, name):
-    filtered = {k: v for k, v in _torchvision_state_dict(name).items()
-                if k not in ('fc.weight', 'fc.bias')}
+    filtered = _adapt_pretrained_state_dict(model, _torchvision_state_dict(name))
     model.load_state_dict(filtered, strict=False)
     return model
 

@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import os
+import time
 
 import numpy as np
 import torch
@@ -385,6 +386,25 @@ class ResNet(nn.Module):
         return x
 
 
+def _adapt_pretrained_state_dict(model, sd):
+    model_sd = model.state_dict()
+    filtered = {}
+    for k, v in sd.items():
+        if k not in model_sd:
+            continue
+        if tuple(v.shape) == tuple(model_sd[k].shape):
+            filtered[k] = v
+        elif k == 'conv1.weight' and v.ndim == 4 \
+                and tuple(v.shape[1:]) == (3, 7, 7) \
+                and tuple(model_sd[k].shape[1:]) == (3, 3, 3):
+            print('adapting conv1.weight 7x7 -> 3x3 (center crop)')
+            filtered[k] = v[:, :, 2:5, 2:5].contiguous()
+        else:
+            print('skip pretrained key %s (shape %s != model %s)'
+                  % (k, tuple(v.shape), tuple(model_sd[k].shape)))
+    return filtered
+
+
 def _load_pretrained(model):
     try:
         import torchvision.models as tvm
@@ -398,7 +418,7 @@ def _load_pretrained(model):
             sd = model_zoo.load_url('https://download.pytorch.org/models/resnet18-5c106cde.pth')
         except Exception as e:
             raise RuntimeError('Could not load ImageNet pretrained weights: %s' % e)
-    filtered = {k: v for k, v in sd.items() if k not in ('fc.weight', 'fc.bias')}
+    filtered = _adapt_pretrained_state_dict(model, sd)
     model.load_state_dict(filtered, strict=False)
     return model
 
@@ -528,7 +548,9 @@ class iCaRLmodel:
         self.epochs = epochs
         self.learning_rate = learning_rate
         self.device = device
-        self.model = network(numclass, feature_extractor)
+        base_model = network(numclass, feature_extractor)
+        self.use_multi_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 1
+        self.model = nn.DataParallel(base_model) if self.use_multi_gpu else base_model
         self.exemplar_set = []
         self.class_mean_set = []
         self.numclass = numclass
@@ -602,12 +624,17 @@ class iCaRLmodel:
     def _get_train_and_test_dataloader(self, classes):
         self.train_dataset.getTrainData(classes, self.exemplar_set)
         self.test_dataset.getTestData(classes)
+        n_devices = torch.cuda.device_count() if self.use_multi_gpu else 1
+        bs = self.batchsize
+        while bs > n_devices and (len(self.test_dataset) % bs) in range(1, n_devices):
+            bs -= 1
         train_loader = DataLoader(dataset=self.train_dataset,
                                   shuffle=True,
-                                  batch_size=self.batchsize)
+                                  batch_size=self.batchsize,
+                                  drop_last=self.use_multi_gpu)
         test_loader = DataLoader(dataset=self.test_dataset,
                                  shuffle=False,
-                                 batch_size=self.batchsize)
+                                 batch_size=bs)
         return train_loader, test_loader
 
     def train(self):
@@ -671,23 +698,32 @@ class iCaRLmodel:
         KNN_accuracy = self._test(self.test_loader, 0)
         print('NMS accuracy:' + str(KNN_accuracy.item()))
 
-        self.old_model = copy.deepcopy(self.model).to(self.device)
+        base = self.model.module if self.use_multi_gpu else self.model
+        self.old_model = copy.deepcopy(base).to(self.device)
+        if self.use_multi_gpu:
+            self.old_model = nn.DataParallel(self.old_model)
         self.old_model.eval()
 
         os.makedirs(self.save_dir, exist_ok=True)
         filename = os.path.join(
             self.save_dir,
             'icarl_ip102_task%d_acc%.3f_knn%.3f.pkl' % (task_id, accuracy, KNN_accuracy))
-        torch.save({'state_dict': self.model.state_dict(),
+        sd = self.model.module.state_dict() if self.use_multi_gpu else self.model.state_dict()
+        torch.save({'state_dict': sd,
                     'numclass': self.numclass,
                     'class_ids': CLASS_IDS}, filename)
         print('model saved to %s' % filename)
         self.evaluate_all(task_id, accuracy, KNN_accuracy)
 
     def _embed(self, image_arrays):
+        chunk = 64
+        if self.use_multi_gpu:
+            n_devices = torch.cuda.device_count()
+            while chunk > n_devices and (len(image_arrays) % chunk) in range(1, n_devices):
+                chunk -= 1
         outs = []
-        for i in range(0, len(image_arrays), 64):
-            batch = self.Image_transform(image_arrays[i:i + 64], self.test_transform).to(self.device)
+        for i in range(0, len(image_arrays), chunk):
+            batch = self.Image_transform(image_arrays[i:i + chunk], self.test_transform).to(self.device)
             with torch.no_grad():
                 feats = F.normalize(self.model.feature_extractor(batch).detach())
             outs.append(feats.cpu().numpy())
@@ -840,7 +876,7 @@ def main():
     print('num_classes:', len(CLASS_IDS), CLASS_IDS)
     print('task_sizes:', TASK_SIZES, '=> tasks:', len(TASK_SIZES),
           '(chay %d task dau)' % min(MAX_TASKS, len(TASK_SIZES)))
-    print('device:', device)
+    print('device:', device, '| gpus:', torch.cuda.device_count() if torch.cuda.is_available() else 0)
     print('batch_size=%d epochs=%d lr=%.2f memory=%d img=%d' %
           (BATCH_SIZE, EPOCHS, LEARNING_RATE, MEMORY_SIZE, IMG_SIZE))
 
@@ -855,17 +891,21 @@ def main():
                        device=device)
 
     num_tasks = min(MAX_TASKS, len(TASK_SIZES))
+    wall0 = time.time()
     for t in range(num_tasks):
         tsize = TASK_SIZES[t]
         model.numclass = sum(TASK_SIZES[:t + 1])
         model.task_size = tsize
+        t0 = time.time()
         print('==== start task %d (classes %d..%d) ====' %
               (t, model.numclass - tsize, model.numclass))
         model.beforeTrain()
         accuracy = model.train()
         model.afterTrain(accuracy, t)
-        print('==== task %d done, softmax acc %.3f ====' % (t, accuracy))
-    print('==== done: %d/%d tasks ====' % (num_tasks, len(TASK_SIZES)))
+        print('==== task %d done, softmax acc %.3f, time %.1f s ====' %
+              (t, accuracy, time.time() - t0))
+    print('==== done: %d/%d tasks, total time %.1f s ====' %
+          (num_tasks, len(TASK_SIZES), time.time() - wall0))
 
 
 if __name__ == '__main__':
