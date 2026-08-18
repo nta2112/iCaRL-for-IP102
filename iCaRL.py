@@ -41,6 +41,7 @@ class iCaRLmodel:
         base_model = network(numclass, feature_extractor)
         self.use_multi_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 1
         self.model = nn.DataParallel(base_model) if self.use_multi_gpu else base_model
+        self.base_model = base_model
         self.exemplar_set = []
         self.class_mean_set = []
         self.numclass = numclass
@@ -110,7 +111,7 @@ class iCaRLmodel:
         classes = [self.numclass - self.task_size, self.numclass]
         self.train_loader, self.test_loader = self._get_train_and_test_dataloader(classes)
         if self.numclass > self.task_size:
-            self.model.Incremental_learning(self.numclass)
+            self.base_model.Incremental_learning(self.numclass)
         self.model.train()
         self.model.to(self.device)
 
@@ -215,7 +216,7 @@ class iCaRLmodel:
         for i in range(0, len(image_arrays), chunk):
             batch = self.Image_transform(image_arrays[i:i + chunk], self.test_transform).to(self.device)
             with torch.no_grad():
-                feats = F.normalize(self.model.feature_extractor(batch).detach())
+                feats = F.normalize(self.base_model.feature_extractor(batch).detach())
             outs.append(feats.cpu().numpy())
         if not outs:
             return np.zeros((0, 512), dtype=np.float32)
@@ -334,7 +335,7 @@ class iCaRLmodel:
     def compute_class_mean(self, images, transform):
         x = self.Image_transform(images, transform).to(self.device)
         feature_extractor_output = F.normalize(
-            self.model.feature_extractor(x).detach()).cpu().numpy()
+            self.base_model.feature_extractor(x).detach()).cpu().numpy()
         class_mean = np.mean(feature_extractor_output, axis=0)
         return class_mean, feature_extractor_output
 
@@ -351,7 +352,7 @@ class iCaRLmodel:
 
     def classify(self, test):
         result = []
-        test = F.normalize(self.model.feature_extractor(test).detach()).cpu().numpy()
+        test = F.normalize(self.base_model.feature_extractor(test).detach()).cpu().numpy()
         class_mean_set = np.array(self.class_mean_set)
         for target in test:
             x = target - class_mean_set
